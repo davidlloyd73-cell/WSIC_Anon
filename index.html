@@ -267,6 +267,22 @@ or click to choose
 <input type="file" id="fileInput" multiple accept=".csv,.tsv,.txt" aria-label="Select WSIC export file">
 <div id="results"></div>
 </section>
+<section class="card" aria-labelledby="reid-h2">
+<h2 id="reid-h2">Re-identify a file</h2>
+<p style="font-size:14px;color:var(--nhs-grey);margin:0 0 10px 0;">
+Turns Patient IDs back into NHS numbers, using the master key loaded above — the reverse of anonymising. Load your key first. Names are not restored (the tool never stored them); look the NHS numbers up in your clinical system.
+</p>
+<label class="dropzone" id="reidDropzone" for="reidInput">
+<strong>Drop an anonymised file here</strong>
+or click to choose
+<div style="font-size:12px; margin-top:6px;">The anonymised .tsv/.csv, or any file whose cells hold Patient IDs</div>
+</label>
+<input type="file" id="reidInput" multiple accept=".csv,.tsv,.txt" aria-label="Select anonymised file to re-identify">
+<div id="reidResults"></div>
+<div style="margin-top:10px;background:#FFF4D6;border-left:4px solid #D99A4E;padding:10px 14px;border-radius:0 6px 6px 0;font-size:13px;color:#5b4a1e;">
+<strong>Identifiable output.</strong> The re-identified file contains real NHS numbers. Keep it on this device, off any cloud-synced folder, and do not email it — the same handling as the master key.
+</div>
+</section>
 <section class="card" aria-labelledby="log-h2">
 <h2 id="log-h2">Session activity log</h2>
 <p style="font-size:14px;color:var(--nhs-grey);margin:0 0 8px 0;">
@@ -303,8 +319,8 @@ WSIC Anonymiser · open source · no data leaves this device<br>
 
 // CHANGE 5: visible build stamp so you can always tell which version is running.
 // Bump these two lines on every change you deploy.
-const APP_VERSION = 'v1.2';
-const BUILD_DATE  = '2026-06-01';
+const APP_VERSION = 'v1.3';
+const BUILD_DATE  = '2026-11-26';
 
 // ---------- Column patterns ----------
 // CHANGE 2: broadened so headers like "NHS #", "NHS No", "NHS_Number", "nhs num"
@@ -399,6 +415,9 @@ const rememberCb = $('rememberKey');
 const dropzone = $('dropzone');
 const fileInput = $('fileInput');
 const resultsDiv = $('results');
+const reidDropzone = $('reidDropzone');
+const reidInput = $('reidInput');
+const reidResults = $('reidResults');
 const logArea = $('logArea');
 
 // ---------- Persistence ----------
@@ -764,6 +783,97 @@ dropzone.classList.remove('dragging');
 dropzone.addEventListener('drop', e => {
 const files = Array.from(e.dataTransfer.files);
 if (files.length) handleFiles(files);
+});
+
+// ---------- Re-identify ----------
+async function handleReidFiles(fileList) {
+reidResults.innerHTML = '';
+if (mapping.size === 0) {
+const card = document.createElement('div');
+card.className = 'result-card error';
+card.innerHTML = '<h3>No master key loaded</h3><div>Load the master key (above) first — re-identification needs the Patient ID ↔ NHS Number mapping.</div>';
+reidResults.appendChild(card);
+log('✗ Re-identify: no master key loaded.');
+return;
+}
+const rev = new Map(); // Patient ID -> NHS number
+for (const [nhs, pid] of mapping) rev.set(pid, nhs);
+for (const f of fileList) {
+try {
+log(`Re-identifying ${f.name} (${(f.size/1024).toFixed(1)} KB)...`);
+const buf = await readFile(f);
+const { text, enc } = decodeBuffer(buf);
+const firstLine = text.split(/\r?\n/, 1)[0] || '';
+const delim = detectDelimiter(firstLine);
+const rows = parseLines(text, delim);
+if (rows.length === 0) throw new Error('Empty file');
+const header = rows[0];
+const data = rows.slice(1);
+let restored = 0, rowsHit = 0, unmatched = 0;
+for (const row of data) {
+let hit = false;
+for (let ci = 0; ci < row.length; ci++) {
+const raw = (row[ci] || '').trim().replace(/^"|"$/g, '');
+if (!raw) continue;
+if (rev.has(raw)) { row[ci] = rev.get(raw); restored++; hit = true; }
+else if (/^Patient\s+\d+$/i.test(raw)) { unmatched++; }
+}
+if (hit) rowsHit++;
+}
+const outText = serialiseTSV(header, data);
+const outName = basename(f.name) + '_reidentified.tsv';
+downloadBlob(outName, outText);
+renderReid(f.name, outName, enc, delim, data.length, restored, rowsHit, unmatched);
+log(`✓ ${f.name}: ${restored} NHS number(s) restored across ${rowsHit} row(s)` + (unmatched ? `, ${unmatched} Patient ID(s) not in this key` : ''));
+} catch (err) {
+const card = document.createElement('div');
+card.className = 'result-card error';
+card.innerHTML = `<h3>${escapeHtml(f.name)} — error</h3><div>${escapeHtml(err.message)}</div>`;
+reidResults.appendChild(card);
+log(`✗ ${f.name}: ${err.message}`);
+}
+}
+}
+
+function renderReid(src, out, enc, delim, nrows, restored, rowsHit, unmatched) {
+const card = document.createElement('div');
+card.className = 'result-card' + (restored === 0 ? ' error' : (unmatched ? ' warn' : ''));
+let extra = '';
+if (restored === 0) {
+extra = `<div class="pid-warning" style="margin-top:10px;border-left-color:var(--nhs-red);background:#FDE6E5;">
+<strong>No Patient IDs matched this key.</strong> Check you loaded the master key that produced this file, and that it still holds "Patient 0001"-style IDs.</div>`;
+} else if (unmatched) {
+extra = `<div class="pid-warning" style="margin-top:10px;">
+<strong>${unmatched} Patient ID(s)</strong> in the file are not in the loaded key, so they were left unchanged. This usually means a different key, or IDs added in a later anonymise run.</div>`;
+}
+card.innerHTML = `
+<h3>${escapeHtml(src)}</h3>
+<dl>
+<dt>Output saved as</dt><dd>${escapeHtml(out)}</dd>
+<dt>Encoding</dt><dd>${enc}</dd>
+<dt>Delimiter</dt><dd>${delim === '\t' ? 'tab' : 'comma'}</dd>
+<dt>Rows processed</dt><dd>${nrows.toLocaleString()}</dd>
+<dt>NHS numbers restored</dt><dd>${restored.toLocaleString()}</dd>
+<dt>Rows re-identified</dt><dd>${rowsHit.toLocaleString()}</dd>
+</dl>${extra}`;
+reidResults.appendChild(card);
+}
+
+reidInput.addEventListener('change', e => {
+if (e.target.files.length) handleReidFiles(Array.from(e.target.files));
+e.target.value = '';
+});
+['dragenter','dragover'].forEach(ev => reidDropzone.addEventListener(ev, e => {
+e.preventDefault(); e.stopPropagation();
+reidDropzone.classList.add('dragging');
+}));
+['dragleave','drop'].forEach(ev => reidDropzone.addEventListener(ev, e => {
+e.preventDefault(); e.stopPropagation();
+reidDropzone.classList.remove('dragging');
+}));
+reidDropzone.addEventListener('drop', e => {
+const files = Array.from(e.dataTransfer.files);
+if (files.length) handleReidFiles(files);
 });
 
 // ---------- Init ----------
